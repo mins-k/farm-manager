@@ -1,38 +1,47 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
+
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  PutCommand,
+  ScanCommand,
+  DeleteCommand,
+  GetCommand,
+} = require("@aws-sdk/lib-dynamodb");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-// MVP용 임시 메모리 DB
-// 서버를 끄면 데이터는 사라짐
-const farms = [
-  { id: "farm-1", name: "청수리", areaMemo: "10정", memo: "주 농장" },
-  { id: "farm-2", name: "양사리1", areaMemo: "4정", memo: "" },
-  {
-    id: "farm-3",
-    name: "양사리2",
-    areaMemo: "5~7정 식재",
-    memo: "벌레 피해 체크 필요",
-  },
-];
+const PORT = process.env.PORT || 4000;
 
-const activities = [];
-const sales = [];
+const FARMS_TABLE = process.env.DYNAMODB_FARMS_TABLE || "bam-farms";
+const ACTIVITIES_TABLE =
+  process.env.DYNAMODB_ACTIVITIES_TABLE || "bam-activities";
+const SALES_TABLE = process.env.DYNAMODB_SALES_TABLE || "bam-sales";
+
+const dynamoClient = new DynamoDBClient({
+  region: process.env.AWS_REGION || "ap-northeast-2",
+});
+
+const db = DynamoDBDocumentClient.from(dynamoClient, {
+  marshallOptions: {
+    removeUndefinedValues: true,
+  },
+});
 
 const activityCategories = [
   "방제",
   "예초",
   "전지",
   "비료",
-  "벌통",
   "수확",
-  "출하",
-  "식재",
-  "장비수리",
+  "밤작업",
   "기타",
 ];
 
@@ -81,254 +90,463 @@ function enrichSale(sale) {
   };
 }
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "bam-farm-backend",
-  });
+async function scanAll(tableName) {
+  let items = [];
+  let lastEvaluatedKey;
+
+  do {
+    const result = await db.send(
+      new ScanCommand({
+        TableName: tableName,
+        ExclusiveStartKey: lastEvaluatedKey,
+      })
+    );
+
+    items = [...items, ...(result.Items || [])];
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey);
+
+  return items;
+}
+
+async function ensureDefaultFarms() {
+  const farms = await scanAll(FARMS_TABLE);
+
+  if (farms.length > 0) {
+    return;
+  }
+
+  const defaultFarms = [
+    {
+      id: "farm-1",
+      name: "청수리",
+      areaMemo: "10정",
+      memo: "주 농장",
+    },
+    {
+      id: "farm-2",
+      name: "양사리1",
+      areaMemo: "4정",
+      memo: "",
+    },
+    {
+      id: "farm-3",
+      name: "양사리2",
+      areaMemo: "5~7정 식재",
+      memo: "벌레 피해 체크 필요",
+    },
+  ];
+
+  await Promise.all(
+    defaultFarms.map((farm) =>
+      db.send(
+        new PutCommand({
+          TableName: FARMS_TABLE,
+          Item: farm,
+        })
+      )
+    )
+  );
+
+  console.log("기본 농장 데이터 생성 완료");
+}
+
+app.get("/api/health", async (req, res) => {
+  try {
+    await db.send(
+      new ScanCommand({
+        TableName: FARMS_TABLE,
+        Limit: 1,
+      })
+    );
+
+    res.json({
+      ok: true,
+      service: "bam-farm-backend",
+      database: "DynamoDB connected",
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      ok: false,
+      service: "bam-farm-backend",
+      database: "DynamoDB connection failed",
+      message: error.message,
+    });
+  }
 });
 
-app.get("/api/farms", (req, res) => {
-  res.json(farms);
+app.get("/api/farms", async (req, res) => {
+  try {
+    const farms = await scanAll(FARMS_TABLE);
+
+    farms.sort((a, b) => a.name.localeCompare(b.name, "ko"));
+
+    res.json(farms);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: "농장 목록을 불러오지 못했습니다.",
+    });
+  }
 });
 
-app.post("/api/farms", (req, res) => {
-  const farm = {
-    id: uuidv4(),
-    name: req.body.name,
-    areaMemo: req.body.areaMemo || "",
-    memo: req.body.memo || "",
-  };
+app.post("/api/farms", async (req, res) => {
+  try {
+    if (!req.body.name?.trim()) {
+      return res.status(400).json({
+        message: "농장 이름은 필수입니다.",
+      });
+    }
 
-  farms.push(farm);
+    const farm = {
+      id: uuidv4(),
+      name: req.body.name.trim(),
+      areaMemo: req.body.areaMemo || "",
+      memo: req.body.memo || "",
+      createdAt: new Date().toISOString(),
+    };
 
-  res.status(201).json(farm);
+    await db.send(
+      new PutCommand({
+        TableName: FARMS_TABLE,
+        Item: farm,
+      })
+    );
+
+    res.status(201).json(farm);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: "농장 저장에 실패했습니다.",
+    });
+  }
 });
 
 app.get("/api/activity-categories", (req, res) => {
   res.json(activityCategories);
 });
 
-app.get("/api/activities", (req, res) => {
-  const { year, farmId, category } = req.query;
+app.get("/api/activities", async (req, res) => {
+  try {
+    const { year, farmId, category } = req.query;
 
-  let result = activities;
+    let activities = await scanAll(ACTIVITIES_TABLE);
 
-  if (year) {
-    result = result.filter(
-      (activity) => String(activity.year) === String(year)
-    );
-  }
+    if (year) {
+      activities = activities.filter(
+        (activity) => String(activity.year) === String(year)
+      );
+    }
 
-  if (farmId) {
-    result = result.filter((activity) => activity.farmId === farmId);
-  }
+    if (farmId) {
+      activities = activities.filter((activity) => activity.farmId === farmId);
+    }
 
-  if (category) {
-    result = result.filter((activity) => activity.category === category);
-  }
+    if (category) {
+      activities = activities.filter(
+        (activity) => activity.category === category
+      );
+    }
 
-  res.json(result.map(enrichActivity));
-});
+    activities.sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
-app.post("/api/activities", (req, res) => {
-  const date = req.body.date;
-  const year = date ? Number(date.slice(0, 4)) : new Date().getFullYear();
+    res.json(activities.map(enrichActivity));
+  } catch (error) {
+    console.error(error);
 
-  const workers = Array.isArray(req.body.workers)
-    ? req.body.workers
-        .map((worker) => ({
-          workerType: worker.workerType,
-          count: toNumber(worker.count),
-          wagePerPerson: toNumber(worker.wagePerPerson),
-        }))
-        .filter((worker) => worker.count > 0)
-    : [];
-
-  const expenses = Array.isArray(req.body.expenses)
-    ? req.body.expenses
-        .map((expense) => ({
-          itemName: expense.itemName || "",
-          quantity: toNumber(expense.quantity),
-          unit: expense.unit || "",
-          unitPrice: toNumber(expense.unitPrice),
-        }))
-        .filter((expense) => expense.itemName)
-    : [];
-
-  const fieldHarvestBags = toNumber(
-    req.body.fieldHarvestBags ?? req.body.harvestBags
-  );
-
-  const activity = {
-    id: uuidv4(),
-    year,
-    date,
-    farmId: req.body.farmId,
-    category: req.body.category,
-    title: req.body.title || "",
-    memo: req.body.memo || "",
-
-    // 작업자 그룹별 인건비
-    workers,
-
-    // 현장 수확 가마
-    fieldHarvestBags,
-
-    // 기존 요약 계산 호환용
-    harvestBags: fieldHarvestBags,
-
-    // 선별 관련
-    sortingStatus: req.body.sortingStatus || "NOT_SORTED",
-    sortedBagCount: toNumber(req.body.sortedBagCount),
-    saleBagWeightKg: toNumber(req.body.saleBagWeightKg),
-    rejectMemo: req.body.rejectMemo || "",
-
-    // 기존 필드 호환용
-    bagWeightKg: toNumber(req.body.bagWeightKg),
-
-    expenses,
-  };
-
-  activities.push(activity);
-
-  res.status(201).json(enrichActivity(activity));
-});
-
-app.delete("/api/activities/:id", (req, res) => {
-  const index = activities.findIndex(
-    (activity) => activity.id === req.params.id
-  );
-
-  if (index === -1) {
-    return res.status(404).json({
-      message: "작업 기록을 찾을 수 없습니다.",
+    res.status(500).json({
+      message: "작업 기록을 불러오지 못했습니다.",
     });
   }
-
-  activities.splice(index, 1);
-
-  res.status(204).send();
 });
 
-app.get("/api/sales", (req, res) => {
-  const { year, buyerType, farmId } = req.query;
+app.post("/api/activities", async (req, res) => {
+  try {
+    const date = req.body.date;
 
-  let result = sales;
+    if (!date) {
+      return res.status(400).json({
+        message: "작업 날짜는 필수입니다.",
+      });
+    }
 
-  if (year) {
-    result = result.filter((sale) => String(sale.year) === String(year));
+    const year = Number(date.slice(0, 4));
+
+    const workers = Array.isArray(req.body.workers)
+      ? req.body.workers
+          .map((worker) => ({
+            workerType: worker.workerType,
+            count: toNumber(worker.count),
+            wagePerPerson: toNumber(worker.wagePerPerson),
+          }))
+          .filter((worker) => worker.count > 0)
+      : [];
+
+    const expenses = Array.isArray(req.body.expenses)
+      ? req.body.expenses
+          .map((expense) => ({
+            itemName: expense.itemName || "",
+            quantity: toNumber(expense.quantity),
+            unit: expense.unit || "",
+            unitPrice: toNumber(expense.unitPrice),
+          }))
+          .filter((expense) => expense.itemName)
+      : [];
+
+    const fieldHarvestBags = toNumber(
+      req.body.fieldHarvestBags ?? req.body.harvestBags
+    );
+
+    const activity = {
+      id: uuidv4(),
+      year,
+      date,
+      farmId: req.body.farmId,
+      category: req.body.category,
+      title: req.body.title || "",
+      memo: req.body.memo || "",
+
+      workers,
+
+      fieldHarvestBags,
+      harvestBags: fieldHarvestBags,
+
+      sortingStatus: req.body.sortingStatus || "NOT_SORTED",
+      sortedBagCount: toNumber(req.body.sortedBagCount),
+      saleBagWeightKg: toNumber(req.body.saleBagWeightKg),
+      rejectMemo: req.body.rejectMemo || "",
+
+      bagWeightKg: toNumber(req.body.bagWeightKg),
+
+      expenses,
+
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db.send(
+      new PutCommand({
+        TableName: ACTIVITIES_TABLE,
+        Item: activity,
+      })
+    );
+
+    res.status(201).json(enrichActivity(activity));
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: "작업 기록 저장에 실패했습니다.",
+    });
   }
-
-  if (buyerType) {
-    result = result.filter((sale) => sale.buyerType === buyerType);
-  }
-
-  if (farmId) {
-    result = result.filter((sale) => sale.farmId === farmId);
-  }
-
-  res.json(result.map(enrichSale));
 });
 
-app.post("/api/sales", (req, res) => {
-  const date = req.body.date;
-  const year = date ? Number(date.slice(0, 4)) : new Date().getFullYear();
+app.delete("/api/activities/:id", async (req, res) => {
+  try {
+    const found = await db.send(
+      new GetCommand({
+        TableName: ACTIVITIES_TABLE,
+        Key: {
+          id: req.params.id,
+        },
+      })
+    );
 
-  const saleMethod = req.body.saleMethod || "SAME_DAY";
+    if (!found.Item) {
+      return res.status(404).json({
+        message: "작업 기록을 찾을 수 없습니다.",
+      });
+    }
 
-  const sale = {
-    id: uuidv4(),
-    year,
-    date,
-    farmId: req.body.farmId,
+    await db.send(
+      new DeleteCommand({
+        TableName: ACTIVITIES_TABLE,
+        Key: {
+          id: req.params.id,
+        },
+      })
+    );
 
-    buyerType: req.body.buyerType || "기타",
-    buyerName: req.body.buyerName || "",
+    res.status(204).send();
+  } catch (error) {
+    console.error(error);
 
-    // SAME_DAY = 당일 미선별 판매
-    // AFTER_SORTING = 선별 후 판매
-    saleMethod,
+    res.status(500).json({
+      message: "작업 기록 삭제에 실패했습니다.",
+    });
+  }
+});
 
-    // FIELD_BAG = 현장 가마
-    // SORTED_SALE_BAG = 선별 후 판매용 가마
-    bagType:
-      req.body.bagType ||
-      (saleMethod === "AFTER_SORTING"
-        ? "SORTED_SALE_BAG"
-        : "FIELD_BAG"),
+app.get("/api/sales", async (req, res) => {
+  try {
+    const { year, buyerType, farmId } = req.query;
 
-    quantityBag: toNumber(req.body.quantityBag),
+    let sales = await scanAll(SALES_TABLE);
 
-    // 당일 미선별 판매면 0으로 저장
-    bagWeightKg:
-      saleMethod === "AFTER_SORTING"
-        ? toNumber(req.body.bagWeightKg)
+    if (year) {
+      sales = sales.filter((sale) => String(sale.year) === String(year));
+    }
+
+    if (buyerType) {
+      sales = sales.filter((sale) => sale.buyerType === buyerType);
+    }
+
+    if (farmId) {
+      sales = sales.filter((sale) => sale.farmId === farmId);
+    }
+
+    sales.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+    res.json(sales.map(enrichSale));
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: "판매 기록을 불러오지 못했습니다.",
+    });
+  }
+});
+
+app.post("/api/sales", async (req, res) => {
+  try {
+    const date = req.body.date;
+
+    if (!date) {
+      return res.status(400).json({
+        message: "판매 날짜는 필수입니다.",
+      });
+    }
+
+    const year = Number(date.slice(0, 4));
+    const saleMethod = req.body.saleMethod || "SAME_DAY";
+
+    const sale = {
+      id: uuidv4(),
+      year,
+      date,
+      farmId: req.body.farmId,
+
+      buyerType: req.body.buyerType || "기타",
+      buyerName: req.body.buyerName || "",
+
+      saleMethod,
+
+      bagType:
+        req.body.bagType ||
+        (saleMethod === "AFTER_SORTING"
+          ? "SORTED_SALE_BAG"
+          : "FIELD_BAG"),
+
+      quantityBag: toNumber(req.body.quantityBag),
+
+      bagWeightKg:
+        saleMethod === "AFTER_SORTING"
+          ? toNumber(req.body.bagWeightKg)
+          : 0,
+
+      pricePerBag: toNumber(req.body.pricePerBag),
+      qualityMemo: req.body.qualityMemo || "",
+      memo: req.body.memo || "",
+
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db.send(
+      new PutCommand({
+        TableName: SALES_TABLE,
+        Item: sale,
+      })
+    );
+
+    res.status(201).json(enrichSale(sale));
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      message: "판매 기록 저장에 실패했습니다.",
+    });
+  }
+});
+
+app.get("/api/summary", async (req, res) => {
+  try {
+    const year = Number(req.query.year || new Date().getFullYear());
+
+    const [allActivities, allSales] = await Promise.all([
+      scanAll(ACTIVITIES_TABLE),
+      scanAll(SALES_TABLE),
+    ]);
+
+    const yearActivities = allActivities
+      .filter((activity) => activity.year === year)
+      .map(enrichActivity);
+
+    const yearSales = allSales
+      .filter((sale) => sale.year === year)
+      .map(enrichSale);
+
+    const totalCost = yearActivities.reduce(
+      (sum, activity) => sum + activity.totalCost,
+      0
+    );
+
+    const totalRevenue = yearSales.reduce(
+      (sum, sale) => sum + sale.totalAmount,
+      0
+    );
+
+    const totalHarvestBags = yearActivities.reduce(
+      (sum, activity) =>
+        sum + toNumber(activity.fieldHarvestBags ?? activity.harvestBags),
+      0
+    );
+
+    const totalSoldBags = yearSales.reduce(
+      (sum, sale) => sum + toNumber(sale.quantityBag),
+      0
+    );
+
+    res.json({
+      year,
+      totalCost,
+      totalRevenue,
+      profit: totalRevenue - totalCost,
+      totalHarvestBags,
+      totalSoldBags,
+
+      // 현장 가마 / 선별 후 판매용 가마가 섞이므로 참고용
+      stockBags: totalHarvestBags - totalSoldBags,
+
+      averagePricePerBag: totalSoldBags
+        ? Math.round(totalRevenue / totalSoldBags)
         : 0,
+    });
+  } catch (error) {
+    console.error(error);
 
-    pricePerBag: toNumber(req.body.pricePerBag),
-    qualityMemo: req.body.qualityMemo || "",
-    memo: req.body.memo || "",
-  };
-
-  sales.push(sale);
-
-  res.status(201).json(enrichSale(sale));
+    res.status(500).json({
+      message: "요약 정보를 불러오지 못했습니다.",
+    });
+  }
 });
 
-app.get("/api/summary", (req, res) => {
-  const year = Number(req.query.year || new Date().getFullYear());
+async function startServer() {
+  try {
+    await ensureDefaultFarms();
 
-  const yearActivities = activities
-    .filter((activity) => activity.year === year)
-    .map(enrichActivity);
+    app.listen(PORT, () => {
+      console.log(`Bam Farm backend running on http://localhost:${PORT}`);
+      console.log(`DynamoDB tables: ${FARMS_TABLE}, ${ACTIVITIES_TABLE}, ${SALES_TABLE}`);
+    });
+  } catch (error) {
+    console.error("서버 시작 실패:", error);
+    process.exit(1);
+  }
+}
 
-  const yearSales = sales
-    .filter((sale) => sale.year === year)
-    .map(enrichSale);
-
-  const totalCost = yearActivities.reduce(
-    (sum, activity) => sum + activity.totalCost,
-    0
-  );
-
-  const totalRevenue = yearSales.reduce(
-    (sum, sale) => sum + sale.totalAmount,
-    0
-  );
-
-  // 총 수확량은 현장 수확 가마 기준
-  const totalHarvestBags = yearActivities.reduce(
-    (sum, activity) =>
-      sum + toNumber(activity.fieldHarvestBags ?? activity.harvestBags),
-    0
-  );
-
-  const totalSoldBags = yearSales.reduce(
-    (sum, sale) => sum + toNumber(sale.quantityBag),
-    0
-  );
-
-  res.json({
-    year,
-    totalCost,
-    totalRevenue,
-    profit: totalRevenue - totalCost,
-    totalHarvestBags,
-    totalSoldBags,
-
-    // 현장 가마와 선별 판매용 가마가 섞일 수 있으니
-    // 이 재고 수치는 현재는 참고용으로만 보면 됨
-    stockBags: totalHarvestBags - totalSoldBags,
-
-    averagePricePerBag: totalSoldBags
-      ? Math.round(totalRevenue / totalSoldBags)
-      : 0,
-  });
-});
-
-const PORT = process.env.PORT || 4000;
-
-app.listen(PORT, () => {
-  console.log(`Bam Farm backend running on http://localhost:${PORT}`);
-});
+startServer();
